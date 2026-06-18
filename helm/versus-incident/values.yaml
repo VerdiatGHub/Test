@@ -1,0 +1,457 @@
+# Default values for Versus Incident Helm chart
+replicaCount: 2
+
+image:
+  repository: ghcr.io/versuscontrol/versus-incident
+  pullPolicy: IfNotPresent
+  tag: ""  # Defaults to .Chart.AppVersion if not set
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+
+service:
+  type: ClusterIP
+  port: 3000
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+    # nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+  hosts:
+    - host: versus-incident.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  # - secretName: versus-incident-tls
+  #   hosts:
+  #     - versus-incident.local
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 200m
+    memory: 256Mi
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 3000
+  initialDelaySeconds: 30
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: 3000
+  initialDelaySeconds: 5
+  periodSeconds: 5
+
+config:
+  name: versus-incident
+  host: 0.0.0.0
+  port: 3000
+  publicHost: ""  # Set to your public host for acknowledgement URLs
+
+# Shared secret required by all admin endpoints (`/api/admin/*` and
+# `/api/agent/*`). Clients send the same value in the `X-Gateway-Secret`
+# header.
+#
+# When `gatewaySecret` is empty the admin routes are NOT registered at
+# all — the agent UI, detect log endpoints, and incident admin endpoints
+# return 404. This is the safest default; set a strong value (32+ random
+# bytes) before exposing the UI or admin endpoints.
+gatewaySecret: ""
+
+# Storage backend used by BOTH the agent (catalog, shadow log, detect log,
+# services, AI cache) and the incident service (history shown in the UI).
+#
+# Supported backends: file (default), postgres
+#   file     — local filesystem; suitable for single-replica deployments.
+#   postgres — durable, multi-replica ready; requires a Postgres DSN.
+storage:
+  type: file        # file | postgres  (env: STORAGE_TYPE)
+  file:
+    maxIncidents: 1000
+  # Persistence for the file backend. The data path is fixed at /app/data.
+  # Required when storage.type=file and you want detect-log / pattern-catalog
+  # / incident-history to survive pod restarts. When disabled, an emptyDir is
+  # used instead (data is lost on rescheduling).
+  persistence:
+    enabled: false
+    size: 1Gi
+    storageClassName: ""   # "" → cluster default
+    accessMode: ReadWriteOnce
+    # Bind to an existing PVC instead of creating a new one.
+    existingClaim: ""
+
+  # -- Postgres backend (storage.type=postgres) ---------------------------
+  # Set STORAGE_TYPE=postgres and supply a DSN to activate. A single
+  # Postgres backend stores incidents, analyses, AND blobs (agent catalog,
+  # shadow log) — no separate object store is required.
+  # Example DSN: postgres://user:pass@postgres:5432/versus?sslmode=require
+  #
+  # postgres:
+  #   dsn: ""           # env: POSTGRES_DSN (preferred over inline value)
+  #   maxIncidents: 1000
+
+# AI SRE Agent (opt-in). When agent.enable=false (default) nothing
+# changes: no goroutines start, no AI calls are made, no extra config
+# blocks are rendered. See docs: src/agent/ai-detect-mode.md
+agent:
+  enable: false
+  # training | shadow | detect
+  #   training : observe + build catalog only
+  #   shadow   : would-have-alerted log, no notifications sent
+  #   detect   : forward unknown / spike patterns to the AI SRE and emit
+  #              incidents through the standard alert pipeline
+  mode: training
+  pollInterval: 30s
+  lookback: 5m
+  newServiceGrace: 30m
+
+  ai:
+    # AI analyzer toggle. Required for detect mode to actually call an LLM.
+    # When false, detect mode classifies patterns but never calls the model
+    # (dry-run; no API key needed).
+    enable: false
+    # OpenAI API key. Stored in the chart Secret and exposed as
+    # AGENT_AI_API_KEY env var.
+    apiKey: ""
+    model: "gpt-4o-mini"
+    # Randomness control. Set -1 to omit temperature entirely for
+    # beta-limited / reasoning models (gpt-5.*, o-series) that fix it
+    # at 1 and reject any explicit value.
+    temperature: 0.2
+    maxTokens: 512
+    maxCallsPerHour: 60
+    cacheTtl: "1h"
+    # AnalyzeAgent — powers POST /api/admin/incidents/:id/analyze and the
+    # "Run analysis" button in the UI. Tool-calling (ReAct), read-only, never
+    # emits a notification. Active whenever ai.enable=true; this block only
+    # tunes it.
+    analyze:
+      # Override the shared ai.model for analyze deep dives. Empty inherits
+      # the top-level model above.
+      model: ""
+
+  # Per-tool configuration for the analyze tools (rendered into tools.yaml).
+  # This is DATA config only, never a registration allow-list — tools are
+  # wired in code. A missing/empty block degrades the affected tool to a
+  # clean "nothing found" rather than an error.
+  tools:
+    # Shared tool-loop knobs applied to every analyze tool dispatch.
+    toolTimeout: "20s"   # cap per tool dispatch; empty/"0"/invalid = 20s default
+    parallelTools: false # run tool calls in one model turn concurrently
+    # recent_changes — correlate an incident with recent deploys / config
+    # changes pulled from one or more REMOTE git repositories' commit
+    # histories (pure-Go go-git; no git binary required). An empty repos
+    # list leaves the tool unregistered.
+    recentChanges:
+      git:
+        # Global default auth applied to every repo without its own block.
+        # Empty relies on ambient credentials.
+        auth:
+          token: ""        # HTTPS access token / PAT (e.g. ${GIT_TOKEN})
+          sshKeyPath: ""   # path to a private SSH key for ssh/scp-like remotes
+        # Each entry: { url, branch?, service?, auth? }. url is required.
+        repos: []
+        #  - url: https://github.com/acme/api.git
+        #    branch: main          # optional; empty = default HEAD
+        #    service: api          # optional; empty = auto-detected from repo name
+        #  - url: git@github.com:acme/web.git   # service auto-detected as "web"
+        #    auth:                 # optional; per-repo override of git.auth
+        #      sshKeyPath: /home/versus/.ssh/web_deploy
+    # describe_dependencies — surface a service's upstream/downstream
+    # neighbours. Only depends_on (upstream) is authored; downstream edges
+    # are derived automatically. An empty services list leaves the tool
+    # unregistered.
+    describeDependencies:
+      services: []
+      #  - name: web
+      #    dependsOn:
+      #      - api
+      #  - name: api
+      #    dependsOn:
+      #      - database
+      #      - cache
+    # find_runbook — ground the analysis in the team's own remediation docs
+    # via a read-only vector search over a runbook corpus you ingest ahead of
+    # time (search-only; never executes remediation). The tool is registered
+    # only when embeddingModel is set AND a storage backend is available.
+    # The query is scrubbed through the redactor BEFORE it is embedded; point
+    # embeddingBaseUrl at a local OpenAI-compatible server to keep embeddings
+    # inside the cluster. Place your *.md runbooks under <data>/runbooks (mount
+    # them into the pod); the server auto-ingests them at boot.
+    #
+    findRunbook:
+      embeddingModel: ""     # e.g. "text-embedding-3-small"; empty = tool omitted
+      embeddingBaseUrl: ""   # OpenAI-compatible endpoint; empty = OpenAI default
+
+  # Inline signal sources. Each entry is rendered verbatim (via toYaml)
+  # into agent_sources.yaml — use snake_case keys matching the Go config
+  # (`from_beginning`, `message_field`, etc.). Leave empty to disable
+  # the agent loop.
+  # Example:
+  #   sources:
+  #     - name: app-logs
+  #       type: file
+  #       enable: true
+  #       file:
+  #         path: /var/log/app.log
+  #         from_beginning: false
+  sources: []
+
+
+# Proxy configuration (global settings)
+# Use this when your network blocks access to messaging services like Telegram, Viber, or Lark
+proxy:
+  # HTTP/HTTPS/SOCKS5 proxy URL (e.g., http://proxy.example.com:8080)
+  url: ""
+  # Optional proxy username for authenticated proxies
+  username: ""
+  # Optional proxy password for authenticated proxies
+  password: ""
+
+alert:
+  debugBody: true
+  
+  slack:
+    enable: false
+    token: ""
+    channelId: ""
+    templatePath: "/app/config/slack_message.tmpl"
+    messageProperties:
+      buttonText: "Acknowledge Alert"
+      buttonStyle: "primary"
+      disableButton: false
+  
+  telegram:
+    enable: false
+    botToken: ""
+    chatId: ""
+    templatePath: "/app/config/telegram_message.tmpl"
+    useProxy: false  # Set to true to use global proxy settings for Telegram API calls
+  
+  viber:
+    enable: false
+    botToken: ""
+    userId: ""
+    channelId: ""
+    apiType: "channel" # "bot" or "channel"
+    templatePath: "/app/config/viber_message.tmpl"
+    useProxy: false  # Set to true to use global proxy settings for Viber API calls
+  
+  email:
+    enable: false
+    smtpHost: ""
+    smtpPort: 587
+    username: ""
+    password: ""
+    to: ""
+    subject: "Incident Alert"
+    templatePath: "/app/config/email_message.tmpl"
+  
+  msteams:
+    enable: false
+    powerAutomateUrl: ""
+    templatePath: "/app/config/msteams_message.tmpl"
+    otherPowerUrls: {}
+  
+  lark:
+    enable: false
+    webhookUrl: ""
+    templatePath: "/app/config/lark_message.tmpl"
+    useProxy: false  # Set to true to use global proxy settings for Lark API calls
+    otherWebhookUrls: {}
+
+  sns:
+    enable: false
+    httpsEndpointSubscriptionPath: "/sns"
+    httpsEndpointSubscription: ""
+    topicArn: ""
+  
+  sqs:
+    enable: false
+    queueUrl: ""
+
+oncall:
+  initializedOnly: false
+  enable: false
+  waitMinutes: 3
+  provider: "aws_incident_manager"
+  
+  awsIncidentManager:
+    responsePlanArn: ""
+    otherResponsePlanArns: {}
+  
+  pagerduty:
+    routingKey: ""
+    otherRoutingKeys: {}
+
+  servicenow:
+    instanceUrl: ""
+    username: ""
+    password: ""
+    table: "incident"
+    otherInstanceUrls: {}
+
+  incidentIo:
+    apiKey: ""
+    alertSourceConfigId: ""
+    otherAlertSourceConfigIds: {}
+
+# Redis configuration
+#
+# Redis is REQUIRED only when on-call is enabled (oncall.enable=true or
+# oncall.initializedOnly=true). When on-call is disabled, the values in this
+# section are ignored and no Redis connection is attempted.
+#
+# There are exactly TWO supported modes. Pick ONE:
+#
+#   1) Bundled Redis (recommended for getting started):
+#        redis.enabled: true
+#        redis.auth.password: "<your-password>"
+#      The chart deploys the Bitnami Redis subchart and the application
+#      automatically connects to "<release-name>-redis-master:6379".
+#      The externalRedis.* block is IGNORED in this mode.
+#
+#   2) External Redis (production / shared Redis):
+#        redis.enabled: false
+#        externalRedis.host: "redis.my-namespace.svc.cluster.local"
+#        externalRedis.password: "<your-password>"
+#      The bundled Redis is NOT deployed; the application connects to the
+#      host/port you provide.
+#
+# Common pitfall: setting externalRedis.host while leaving redis.enabled=true
+# silently ignores externalRedis.* — the app talks to the bundled Redis.
+redis:
+  # Enable the bundled Redis subchart. Set to false to use externalRedis.
+  enabled: false
+
+  # Authentication parameters for the built-in Redis (used only when enabled=true)
+  auth:
+    enabled: true
+    password: ""
+
+  # Redis architecture choice
+  architecture: standalone
+
+  # Redis master configuration
+  master:
+    persistence:
+      enabled: true
+      size: 8Gi
+
+# External Redis configuration (used only when redis.enabled=false)
+externalRedis:
+  # Redis server hostname or IP address.
+  # Must be reachable from the versus-incident pods (resolve via DNS or IP).
+  # Example: "redis-master.redis.svc.cluster.local"
+  host: ""
+  # Redis server port
+  port: 6379
+  # Redis authentication password
+  password: ""
+  # Skip TLS certificate verification (not recommended for production)
+  insecureSkipVerify: false
+  # Redis database number
+  db: 0
+  # Redis connection parameters.
+  # Defaults are intentionally generous so transient DNS/network slowness
+  # in Kubernetes does not surface as "context deadline exceeded". Tune
+  # downward if you need faster failure detection.
+  connectionTimeout: 30 # connection timeout in seconds
+  readTimeout: 30       # read timeout in seconds
+  writeTimeout: 30      # write timeout in seconds
+  maxRetries: 3         # maximum number of retries
+  minRetryBackoff: 8    # minimum backoff in milliseconds
+  maxRetryBackoff: 512  # maximum backoff in milliseconds
+  # TLS/SSL configuration
+  tls:
+    enabled: false
+    # Path to the CA certificate file when using custom CA
+    caFile: ""
+    # Path to the client certificate file
+    certFile: ""
+    # Path to the client certificate key file
+    keyFile: ""
+
+# Templates configuration
+# If not provided, the default templates included in the container will be used
+# To use a custom template, uncomment the relevant template section and modify it
+templates: {}
+  # Custom Slack template (optional - if not defined, the default from the container will be used)
+  # slack: |
+  #   *Critical Error in {{.ServiceName}}*
+  #   ----------
+  #   Error Details:
+  #   ```
+  #   {{.Logs}}
+  #   ```
+  #   ----------
+  #   Owner <@{{.UserID}}> please investigate
+  
+  # Custom Telegram template (optional - if not defined, the default from the container will be used)
+  # telegram: |
+  #   🚨 <b>Critical Error Detected!</b> 🚨
+  #   📌 <b>Service:</b> {{.ServiceName}}
+  #   ⚠️ <b>Error Details:</b>
+  #   {{.Logs}}
+  
+  # Custom Microsoft Teams template (optional - if not defined, the default from the container will be used)
+  # msteams: |
+  #   # Critical Error in {{.ServiceName}}
+  #    
+  #   ### Error Details:
+  #   
+  #   ```{{.Logs}}```
+  #   
+  #   ## Additional Information
+  #   
+  #   - Source: {{.Source}}
+  #   - Severity: {{.Severity}}
+  #   - Incident ID: {{.IncidentID}}
+  #   
+  #   Please [investigate immediately](https://your-dashboard-url.com/incidents/{{.IncidentID}})
+  #   
+  #   *Alert sent by Versus Incident Management*
+  
+  # Custom Email template (optional - if not defined, the default from the container will be used)
+  # email: |
+  #   Subject: Critical Error Alert - {{.ServiceName}}
+  #   
+  #   Critical Error Detected in {{.ServiceName}}
+  #   ----------------------------------------
+  #   
+  #   Error Details:
+  #   {{.Logs}}
+  #   
+  #   Please investigate this issue immediately.
+  #   
+  #   Best regards,
+  #   Versus Incident Management System
+  
+  # Custom Lark template (optional - if not defined, the default from the container will be used)
+  # lark: |
+  #   Critical Error in {{.ServiceName}}
+  #   
+  #   **Error Details:**
+  #   
+  #   ```{{.Logs}}```
+  #   
+  #   {{ if .AckURL }}
+  #   
+  #   [Click here to acknowledge]({{.AckURL}})
+  #   {{ end }}

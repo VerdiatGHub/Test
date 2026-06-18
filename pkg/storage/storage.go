@@ -1,0 +1,209 @@
+// Package storage is the persistence layer used by the agent (pattern
+// catalog, shadow log, service registry) and by the incident service
+// (incident history). One Provider is constructed at boot from
+// `storage:` in config.yaml and passed to every consumer that needs to
+// read or write durable state.
+//
+// The interface is split into two concerns:
+//
+//   - Blob: opaque byte slices keyed by short name. Used by the agent
+//     catalog and shadow log, both of which already serialize themselves
+//     to JSON. Backends translate the name into a file path / Redis key
+//     / row.
+//   - Incident: first-class CRUD-ish operations because the UI lists,
+//     filters, and acks incidents.
+//
+// Backends today:
+//   - file (pkg/storage/file.go) — production
+//   - memory (pkg/storage/memory.go) — tests only
+//   - redis (pkg/storage/redis.go) — config stub, returns ErrUnsupported
+//   - database (pkg/storage/database.go) — config stub
+package storage
+
+import (
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/VersusControl/versus-incident/pkg/core"
+)
+
+// ErrNotFound is returned by Get* methods when the key/id is missing.
+// File and memory backends translate os.ErrNotExist into ErrNotFound so
+// callers can rely on errors.Is(err, storage.ErrNotFound).
+var ErrNotFound = errors.New("storage: not found")
+
+// ErrUnsupported is returned by the redis/database stub backends.
+var ErrUnsupported = errors.New("storage: backend not implemented")
+
+// DefaultDataDir is the application's persistent data directory. The
+// `file` storage backend persists its JSON here (incidents, pattern
+// catalog, shadow/detect logs, AI cache, runbook corpus); on-disk assets
+// that are independent of the configured storage backend also live here,
+// such as the runbook source files under runbooks/. It is relative to the
+// process working directory; in the container image (WORKDIR /app) it
+// resolves to /app/data.
+const DefaultDataDir = "data"
+
+// DefaultOrgID is the org every record carries when no explicit
+// organization is supplied. Single-tenant OSS deployments never set an
+// org, so every persisted record transparently belongs to "default" and
+// no behaviour changes. Multi-tenant scoping (enterprise) overrides this
+// per request via the org-injection seam (pkg/middleware).
+const DefaultOrgID = "default"
+
+// NormalizeOrgID returns a non-empty org id, falling back to
+// DefaultOrgID when s is blank. Backends call this on the persistence
+// path so a record is never stored with an empty OrgID.
+func NormalizeOrgID(s string) string {
+	if s == "" {
+		return DefaultOrgID
+	}
+	return s
+}
+
+// Provider is the storage interface used by the agent and incident
+// service.
+type Provider interface {
+	// ReadBlob returns the contents previously written under name.
+	// Missing blobs MUST return (nil, nil) — not ErrNotFound — so the
+	// agent's "fresh start" path stays a single line.
+	ReadBlob(name string) ([]byte, error)
+	// WriteBlob atomically replaces the blob stored under name.
+	WriteBlob(name string, data []byte) error
+
+	// SaveIncident appends a new incident to the store. Subsequent
+	// SaveIncident calls with the same ID overwrite the existing record
+	// (used by the ack path). Implementations are responsible for
+	// trimming the history to a sane upper bound — the file backend
+	// caps at MaxIncidents.
+	SaveIncident(rec *IncidentRecord) error
+	// UpdateIncidentAck stamps an existing incident as acknowledged.
+	// Returns ErrNotFound when the id is unknown.
+	UpdateIncidentAck(id string, ackedAt time.Time) error
+	// GetIncident returns one incident or ErrNotFound.
+	GetIncident(id string) (*IncidentRecord, error)
+	// ListIncidents returns the most recent incidents, newest first.
+	// limit <= 0 returns the full window.
+	ListIncidents(limit int) ([]*IncidentRecord, error)
+
+	// SaveAnalysis stores (or replaces by ID) one analyze-mode run.
+	SaveAnalysis(rec *AnalysisRecord) error
+	// GetAnalysis returns one analysis or ErrNotFound.
+	GetAnalysis(id string) (*AnalysisRecord, error)
+	// ListAnalysesByIncident returns all analyses for one incident,
+	// newest first. limit <= 0 returns the full window.
+	ListAnalysesByIncident(incidentID string, limit int) ([]*AnalysisRecord, error)
+	// ListAnalyses returns analyses across all incidents, newest first.
+	// limit <= 0 returns the full window.
+	ListAnalyses(limit int) ([]*AnalysisRecord, error)
+	// DeleteAnalysis removes one analysis. Returns ErrNotFound when the
+	// id is unknown.
+	DeleteAnalysis(id string) error
+
+	// Close releases any underlying resources (file handles, redis
+	// connections, db pools). Calling Close on a closed provider is a
+	// no-op.
+	Close() error
+}
+
+// Searcher is an optional capability a backend may implement on top of
+// Provider. It exposes full-text-style search over incidents and
+// analyses. Backends that cannot search efficiently (memory, file) do
+// not implement it; callers type-assert and fall back to ListIncidents
+// when the assertion fails. The Postgres backend implements it.
+type Searcher interface {
+	// SearchIncidents returns incidents whose title, service, source,
+	// or JSON body match the case-insensitive query, newest first.
+	// An empty query returns the most recent incidents (same as
+	// ListIncidents). limit <= 0 returns the full window.
+	SearchIncidents(query string, limit int) ([]*IncidentRecord, error)
+	// SearchAnalyses returns analyses whose JSON body matches the
+	// case-insensitive query, newest first. limit <= 0 returns the
+	// full window.
+	SearchAnalyses(query string, limit int) ([]*AnalysisRecord, error)
+}
+
+// IncidentRecord is the durable shape of an incident. It mirrors the
+// runtime models.Incident plus the audit fields the UI needs (when it
+// happened, who got notified, was it acked, raw payload for debugging).
+type IncidentRecord struct {
+	ID string `json:"id"`
+	// OrgID scopes the record to one organization. Defaults to
+	// storage.DefaultOrgID ("default") so single-tenant OSS users never
+	// see or set it; enterprise multi-tenant routing reads it to isolate
+	// orgs.
+	OrgID    string `json:"org_id,omitempty"`
+	TeamID   string `json:"team_id,omitempty"`
+	Title    string `json:"title,omitempty"`
+	Source   string `json:"source,omitempty"`  // "webhook" | "sns" | "sqs" | ...
+	Service  string `json:"service,omitempty"` // best-effort from payload
+	Resolved bool   `json:"resolved"`
+	// ChannelsEnabled is the snapshot of channels that were configured
+	// when the alert fired. ChannelsNotified is the subset that
+	// actually succeeded. The two diverge whenever a channel fails:
+	// keep both so the UI can show "Slack failed" without losing the
+	// fact that Slack was supposed to be tried.
+	ChannelsEnabled  []string `json:"channels_enabled,omitempty"`
+	ChannelsNotified []string `json:"channels_notified,omitempty"`
+	OnCallTriggered  bool     `json:"oncall_triggered,omitempty"`
+	OnCallError      string   `json:"oncall_error,omitempty"`
+	// NotifyStatus reflects the outcome of the alert fan-out:
+	// "pending" — record persisted, fan-out not yet attempted
+	// "sent"    — every enabled channel returned success
+	// "partial" — at least one channel succeeded, at least one failed
+	// "failed"  — no channel succeeded
+	NotifyStatus string                 `json:"notify_status,omitempty"`
+	NotifyError  string                 `json:"notify_error,omitempty"`
+	CreatedAt    time.Time              `json:"created_at"`
+	AckedAt      *time.Time             `json:"acked_at,omitempty"`
+	ResolvedAt   *time.Time             `json:"resolved_at,omitempty"`
+	Content      map[string]interface{} `json:"content,omitempty"`
+
+	// AssignedTeamID and AssignedMemberIDs record an operator's
+	// assignment for this incident. Routing logic (Phase 2) will read
+	// these to pick channels per assignee; the storage layer only
+	// holds the references. Empty means unassigned.
+	AssignedTeamID    string   `json:"assigned_team_id,omitempty"`
+	AssignedMemberIDs []string `json:"assigned_member_ids,omitempty"`
+}
+
+// AnalysisRecord is the durable shape of one analyze-mode run. The
+// admin /analyze endpoint creates one per request; the UI lists them
+// per incident.
+type AnalysisRecord struct {
+	ID string `json:"id"`
+	// OrgID scopes the analysis to one organization. Defaults to
+	// storage.DefaultOrgID ("default"); see IncidentRecord.OrgID.
+	OrgID       string    `json:"org_id,omitempty"`
+	IncidentID  string    `json:"incident_id"`
+	RequestedAt time.Time `json:"requested_at"`
+	RequestedBy string    `json:"requested_by,omitempty"`
+	DurationMs  int64     `json:"duration_ms,omitempty"`
+	Model       string    `json:"model,omitempty"`
+
+	// ToolCalls is the full audit trail of read-only tool invocations
+	// the agent issued during the run, in execution order.
+	ToolCalls []AnalysisToolCall `json:"tool_calls,omitempty"`
+
+	// Finding is the parsed structured output from the model. Nil when
+	// the run failed before the model produced JSON.
+	Finding *core.AIFinding `json:"finding,omitempty"`
+
+	// RawResponse is the model's final assistant message. Kept for
+	// audit / debugging when ParseFinding fails.
+	RawResponse string `json:"raw_response,omitempty"`
+
+	// Status is one of: "ok", "error", "rate_limited".
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+// AnalysisToolCall captures one tool round-trip for the audit log.
+type AnalysisToolCall struct {
+	Name       string          `json:"name"`
+	Args       json.RawMessage `json:"args,omitempty"`
+	Output     json.RawMessage `json:"output,omitempty"`
+	DurationMs int64           `json:"duration_ms,omitempty"`
+	Error      string          `json:"error,omitempty"`
+}

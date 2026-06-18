@@ -1,0 +1,159 @@
+# -----------------------------------------------------------------------------
+# Agent signal sources.
+#
+# Loaded automatically by Versus when this file sits next to the main
+# config file (path is hardcoded — no `sources_path` setting). Drop the
+# file or rename it to disable all sources without editing config.yaml.
+#
+# Each entry must have:
+#   name:    unique identifier (used in cursor keys and admin views)
+#   type:    "file" | "elasticsearch" | "loki" | "cloudwatchlogs" | "graylog" | "splunk"
+#   enable:  true | false
+# Plus the matching block (`file:` / `elasticsearch:` / `loki:` /
+# `cloudwatchlogs:` / `graylog:` / `splunk:`) for the chosen type.
+# -----------------------------------------------------------------------------
+sources:
+  # File source — easiest way to test the agent end-to-end. Drop a log file
+  # in local/resource/ and point this at it. See local/resource/README.md.
+
+  - name: noisy-app
+    type: file
+    enable: true
+    file:
+      path: ./local/resource/noisy-app.log
+      format: text
+      from_beginning: true
+      max_lines_per_pull: 5000
+
+  # - name: sample-app
+  #   type: file
+  #   enable: false                # set true to enable this source
+  #   file:
+  #     path: ./local/resource/sample-app.log
+  #     format: text                # "text" or "json"
+  #     from_beginning: true        # set false in production to tail from EOF
+  #     # cursor_path: ./data/cursors/file-sample-app.cursor
+  #     max_line_bytes: 65536
+  #     max_lines_per_pull: 1000
+  #     timestamp_layout: "2006-01-02T15:04:05Z07:00"
+  #     JSON-mode field overrides:
+  #     message_field: message
+  #     timestamp_field: "@timestamp"
+  #     severity_field: level
+
+  - name: es-app
+    type: elasticsearch
+    enable: false
+    elasticsearch:
+      addresses:
+        - http://localhost:9200
+      index: "logstash-*"
+      time_field: "@timestamp"
+      query: '*'
+      message_field: "@message"
+      page_size: 500
+
+  # - name: es-app-with-queries
+  #   type: elasticsearch
+  #   enable: false                 # set true after configuring credentials
+  #   elasticsearch:
+  #     addresses:
+  #       - https://es.example.internal:9200
+  #     username: ${ES_USERNAME}
+  #     password: ${ES_PASSWORD}
+  #     # api_key: ${ES_API_KEY}    # alternative to user/pass
+  #     insecure_skip_verify: false
+  #     index: "logs-app-*"
+  #     time_field: "@timestamp"
+  #     query: 'log.level:(error OR warn)'
+  #     message_field: message
+  #     severity_field: log.level
+  #     extra_fields:
+  #       - service.name
+  #       - host.name
+  #       - error.stack_trace
+  #     page_size: 500
+
+  # Grafana Loki source.
+  # - name: loki-prod
+  #   type: loki
+  #   enable: false
+  #   loki:
+  #     address: http://loki:3100        # or https://logs-prod-...grafana.net for Grafana Cloud
+  #     # tenant_id: ${LOKI_TENANT_ID}    # multi-tenant Loki / Grafana Cloud
+  #     # username: ${LOKI_USERNAME}      # Grafana Cloud: instance ID
+  #     # password: ${LOKI_PASSWORD}      # Grafana Cloud: API token
+  #     # bearer_token: ${LOKI_TOKEN}     # alternative to user/pass
+  #     # insecure_skip_verify: false
+  #     query: '{app="api",env="prod"} |= "error"'
+  #     severity_field: level             # read from stream labels
+  #     extra_labels:
+  #       - app
+  #       - namespace
+  #     page_size: 500
+
+  # AWS CloudWatch Logs source.
+  # Auth uses the standard AWS SDK chain (env vars, ~/.aws/credentials,
+  # IAM instance/task role). Required IAM:
+  #   logs:FilterLogEvents on the target log group.
+  # - name: cwlogs-lambda
+  #   type: cloudwatchlogs
+  #   enable: false
+  #   cloudwatchlogs:
+  #     region: us-east-1
+  #     log_group_name: /aws/lambda/my-function
+  #     # log_stream_prefix: 2026/05/12     # narrow to recent streams (cheaper)
+  #     # filter_pattern: '?ERROR ?Exception'  # CloudWatch filter syntax (NOT regex)
+  #     page_size: 500
+
+  # Graylog source.
+  # Uses the legacy `search/universal/absolute` REST endpoint —
+  # synchronous, sorted ascending, cursor-friendly. Pick ONE auth mode:
+  # API token (Graylog convention: token-as-username + literal "token"
+  # password), or plain HTTP Basic.
+  # - name: graylog-prod
+  #   type: graylog
+  #   enable: false
+  #   graylog:
+  #     address: https://graylog.example.internal:9000
+  #     # api_token: ${GRAYLOG_API_TOKEN}   # preferred; sent as Basic <token>:token
+  #     # username: ${GRAYLOG_USERNAME}     # fallback HTTP Basic
+  #     # password: ${GRAYLOG_PASSWORD}
+  #     # insecure_skip_verify: false
+  #     query: 'level:(3 OR 4) AND service:api'
+  #     # stream_id: 000000000000000000000001   # restrict to a single stream
+  #     message_field: message
+  #     severity_field: level
+  #     # fields:                  # server-side projection (faster / smaller)
+  #     #   - message
+  #     #   - timestamp
+  #     #   - source
+  #     #   - level
+  #     extra_fields:              # copied into Signal.Fields
+  #       - source
+  #       - service
+  #     page_size: 500
+
+  # Splunk source.
+  # Uses the streaming `search/v2/jobs/export` REST endpoint. Auth is
+  # bearer token (HEC / auth token) when set; HTTP Basic otherwise.
+  # `search` is auto-prefixed with the `search` operator when missing.
+  # - name: splunk-prod
+  #   type: splunk
+  #   enable: false
+  #   splunk:
+  #     address: https://splunk.example.internal:8089
+  #     token: ${SPLUNK_TOKEN}             # preferred; Authorization: Bearer <token>
+  #     # username: ${SPLUNK_USERNAME}      # fallback HTTP Basic
+  #     # password: ${SPLUNK_PASSWORD}
+  #     # insecure_skip_verify: false
+  #     search: 'index=main sourcetype=api level=error'
+  #     time_field: _time
+  #     message_field: _raw
+  #     severity_field: level
+  #     extra_fields:
+  #       - host
+  #       - source
+  #       - sourcetype
+  #     page_size: 500
+

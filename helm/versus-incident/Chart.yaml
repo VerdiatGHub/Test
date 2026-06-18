@@ -1,0 +1,13 @@
+apiVersion: v2
+name: versus-incident
+description: A Helm chart for Versus Incident Management System
+type: application
+version: 1.4.3
+appVersion: "1.4.3"
+
+# Dependencies
+dependencies:
+  - name: redis
+    version: "^21.0.0"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: redis.enabled

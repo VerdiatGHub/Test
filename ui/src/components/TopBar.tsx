@@ -1,0 +1,186 @@
+import { useContext } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import { Menu, Moon, Search, Sun } from "lucide-react";
+import clsx from "clsx";
+import { api } from "@/lib/api";
+import { useOpenIncidentCount } from "@/lib/hooks";
+import { useTheme } from "@/lib/theme";
+import { ShellContext } from "./AppShell";
+
+// TopBar truth table (audit S6 — the old bar showed a red "Agent
+// unreachable" alarm during its own initial load and treated "disabled"
+// and "down" identically):
+//   config says enable:false      → neutral gray "agent off"
+//   liveness loading (first time) → dim pulse, never red
+//   liveness error ×3 consecutive → red "unreachable"
+//   liveness error <3             → amber "reconnecting…"
+//   ok                            → mode chip; the MODE is the status
+//                                   (training=info, shadow=warn, detect=ok)
+interface Props {
+  title: string;
+  subtitle?: string;
+  actions?: React.ReactNode;
+}
+
+export function TopBar({ title, subtitle, actions }: Props) {
+  const shell = useContext(ShellContext);
+  const navigate = useNavigate();
+  const { open } = useOpenIncidentCount();
+  const { theme, toggle } = useTheme();
+
+  const liveness = useQuery({
+    queryKey: ["status-pulse"],
+    queryFn: api.status,
+    refetchInterval: () => (document.hidden ? false : 30_000),
+    retry: 1,
+  });
+  const config = useQuery({
+    queryKey: ["agent-config"],
+    queryFn: api.getAgentConfig,
+    staleTime: 60_000,
+    retry: 1,
+  });
+
+  return (
+    <header
+      className="z-sticky flex h-14 shrink-0 items-center justify-between gap-3
+                 border-b border-ink-600 bg-surface-sunken px-4 lg:px-6"
+    >
+      <div className="flex min-w-0 items-center gap-3">
+        <button
+          aria-label="Open navigation"
+          className="rounded-control p-1.5 text-ink-300 hover:bg-ink-700 hover:text-ink-100 lg:hidden"
+          onClick={() => shell?.openDrawer()}
+        >
+          <Menu size={18} />
+        </button>
+        <div className="flex min-w-0 items-baseline gap-3">
+          <h1 className="truncate text-base font-semibold text-ink-50">{title}</h1>
+          {subtitle && (
+            <span className="hidden truncate text-xs text-ink-300 sm:inline">
+              {subtitle}
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="flex shrink-0 items-center gap-3">
+        {actions}
+        <button
+          aria-label={
+            theme === "dark" ? "Switch to light theme" : "Switch to dark theme"
+          }
+          title={
+            theme === "dark" ? "Switch to light theme" : "Switch to dark theme"
+          }
+          className="rounded-control p-1.5 text-ink-400 hover:bg-ink-700 hover:text-ink-100"
+          onClick={toggle}
+        >
+          {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
+        </button>
+        <button
+          aria-label="Search (press /)"
+          title="Search — press /"
+          className="hidden rounded-control p-1.5 text-ink-400 hover:bg-ink-700 hover:text-ink-100 sm:block"
+          onClick={() => {
+            const el =
+              document.querySelector<HTMLElement>("[data-page-search]");
+            if (el) {
+              el.focus();
+            } else {
+              // Same fallback as the "/" shortcut (§2.4): pages without a
+              // search land on Incidents instead of a silent no-op.
+              navigate("/incidents");
+              window.setTimeout(() => {
+                document
+                  .querySelector<HTMLElement>("[data-page-search]")
+                  ?.focus();
+              }, 80);
+            }
+          }}
+        >
+          <Search size={15} />
+        </button>
+        {open > 0 && (
+          <Link
+            to="/incidents?status=open"
+            className="rounded-full bg-sev-critical/15 px-2 py-0.5 text-2xs font-semibold tabular-nums text-sev-critical hover:bg-sev-critical/25"
+          >
+            {open} open
+          </Link>
+        )}
+        <AgentChip
+          configLoading={config.isLoading}
+          agentEnabled={config.data?.enable}
+          mode={config.data?.mode}
+          livenessLoading={liveness.isLoading}
+          livenessError={liveness.isError}
+          failures={liveness.failureCount}
+        />
+      </div>
+    </header>
+  );
+}
+
+function AgentChip({
+  configLoading,
+  agentEnabled,
+  mode,
+  livenessLoading,
+  livenessError,
+  failures,
+}: {
+  configLoading: boolean;
+  agentEnabled?: boolean;
+  mode?: string;
+  livenessLoading: boolean;
+  livenessError: boolean;
+  failures: number;
+}) {
+  let cls = "border-ink-500 bg-ink-700 text-ink-300";
+  let dot = "bg-ink-400";
+  let label = "agent";
+
+  if (livenessLoading || configLoading) {
+    label = "connecting…";
+    dot = "motion-safe:animate-pulse bg-ink-300";
+  } else if (livenessError) {
+    if (failures >= 3) {
+      label = "unreachable";
+      cls = "border-sev-critical/40 bg-sev-critical/15 text-sev-critical";
+      dot = "bg-sev-critical";
+    } else {
+      label = "reconnecting…";
+      cls = "border-sev-warn/40 bg-sev-warn/15 text-sev-warn";
+      dot = "motion-safe:animate-pulse bg-sev-warn";
+    }
+  } else if (agentEnabled === false) {
+    label = "agent off";
+  } else if (mode) {
+    label = mode;
+    if (mode === "detect") {
+      cls = "border-sev-ok/40 bg-sev-ok/15 text-sev-ok";
+      dot = "bg-sev-ok";
+    } else if (mode === "shadow") {
+      cls = "border-sev-warn/40 bg-sev-warn/15 text-sev-warn";
+      dot = "bg-sev-warn";
+    } else {
+      cls = "border-sev-info/40 bg-sev-info/15 text-sev-info";
+      dot = "bg-sev-info";
+    }
+  }
+
+  return (
+    <Link
+      to="/agent"
+      className={clsx(
+        "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-2xs font-medium",
+        cls,
+      )}
+    >
+      <span aria-hidden className={clsx("h-1.5 w-1.5 rounded-full", dot)} />
+      {label}
+    </Link>
+  );
+}

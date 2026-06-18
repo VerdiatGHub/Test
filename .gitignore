@@ -1,0 +1,27 @@
+tmp
+tmp.txt
+*.sh
+!scripts/*.sh
+!helm/**/*.sh
+.air.conf
+book
+local
+data
+AGENTS.md
+reactflow
+charts
+__pycache__
+coverage.out
+plans
+.github/copilot-instructions.md
+PROJECT_STRUCTURE.md
+EINO_PATTERNS.md
+
+# --- build artifacts & local runtime (added for setup) ---
+*.exe
+*.exe~
+*.log
+*.zip
+__pycache__/
+patch*.py
+ui/tsconfig.app.tsbuildinfo

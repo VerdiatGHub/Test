@@ -1,0 +1,133 @@
+// Package eino contains the Eino-backed chat model wrapper used by all
+// AI agents in versus-incident. It is the ONLY package in the codebase
+// that imports Eino's model package — every concrete AI agent (detect,
+// analyze, ...) goes through this helper so a future framework swap
+// only touches one file.
+//
+// There is no `framework` knob in the config. Eino is the
+// implementation; if operators need a different backend they bring it
+// up here.
+package eino
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"time"
+
+	einoopenai "github.com/cloudwego/eino-ext/components/model/openai"
+	"github.com/cloudwego/eino/components/model"
+
+	"github.com/VersusControl/versus-incident/pkg/config"
+)
+
+// BaseURL is overridable for tests. Production code passes "" to use
+// the Eino / go-openai default (https://api.openai.com/v1). The agent
+// admin endpoints never expose this; only the chatmodel test sets it
+// to point at an httptest server.
+type Options struct {
+	HTTPClient *http.Client
+	BaseURL    string
+	Timeout    time.Duration
+}
+
+// NewChatModel builds an Eino ChatModel configured for JSON-mode
+// structured output. cfg must already be the *resolved* per-task
+// config (see AgentAIConfig.Resolve) — this helper does not look at
+// the per-task sub-blocks.
+//
+// Model must be set; APIKey may be empty (the OpenAI ACL client errors
+// at call time, not construction time, which is fine for tests).
+func NewChatModel(ctx context.Context, cfg config.AgentAIConfig, opts Options) (model.BaseChatModel, error) {
+	if cfg.Model == "" {
+		return nil, fmt.Errorf("eino: model is empty")
+	}
+
+	timeout := opts.Timeout
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+
+	// MaxTokens maps to the provider's max_completion_tokens. The default
+	// is reasoning-safe: for gpt-5.* / o-series models the budget is shared
+	// by hidden reasoning tokens and the visible reply, so a low cap can be
+	// fully consumed by reasoning and yield empty content.
+	maxCompletionTokens := cfg.MaxTokens
+	if maxCompletionTokens == 0 {
+		maxCompletionTokens = 2048
+	}
+
+	conf := &einoopenai.ChatModelConfig{
+		APIKey:     cfg.APIKey,
+		Timeout:    timeout,
+		HTTPClient: opts.HTTPClient,
+		BaseURL:    opts.BaseURL,
+		Model:      cfg.Model,
+		// OpenAI-compatible reasoning/beta models (gpt-5.*, o-series)
+		// reject `max_tokens`; send the supported field instead.
+		MaxCompletionTokens: &maxCompletionTokens,
+		Temperature:         resolveTemperature(cfg.Temperature, 0.2),
+		// Force JSON-mode so ParseFinding can decode the reply with the
+		// same tolerance it had under the raw HTTP client.
+		ResponseFormat: &einoopenai.ChatCompletionResponseFormat{
+			Type: einoopenai.ChatCompletionResponseFormatTypeJSONObject,
+		},
+	}
+
+	return einoopenai.NewChatModel(ctx, conf)
+}
+
+// NewToolCallingChatModel mirrors NewChatModel but returns the
+// tool-calling variant. The analyze agent needs WithTools to register
+// its read-only tool catalog; detect uses the base helper above.
+//
+// IMPORTANT: this helper deliberately does NOT force JSON-mode. With
+// tools bound, the model alternates between tool_calls (JSON, never
+// content) and a final assistant message; forcing JSON-mode causes
+// providers to reject the tool-call turns.
+func NewToolCallingChatModel(ctx context.Context, cfg config.AgentAIConfig, opts Options) (model.ToolCallingChatModel, error) {
+	if cfg.Model == "" {
+		return nil, fmt.Errorf("eino: model is empty")
+	}
+
+	timeout := opts.Timeout
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+
+	// Analyze is a multi-step ReAct loop (tool calls + final answer), so it
+	// needs even more headroom than detect for reasoning models.
+	maxCompletionTokens := cfg.MaxTokens
+	if maxCompletionTokens == 0 {
+		maxCompletionTokens = 4096
+	}
+
+	conf := &einoopenai.ChatModelConfig{
+		APIKey:              cfg.APIKey,
+		Timeout:             timeout,
+		HTTPClient:          opts.HTTPClient,
+		BaseURL:             opts.BaseURL,
+		Model:               cfg.Model,
+		MaxCompletionTokens: &maxCompletionTokens,
+		Temperature:         resolveTemperature(cfg.Temperature, 0.2),
+	}
+
+	return einoopenai.NewChatModel(ctx, conf)
+}
+
+// A NEGATIVE value is the explicit "omit temperature" sentinel:
+// it returns nil so the provider applies its own default. This is
+// required for beta-limited / reasoning models (e.g. the gpt-5 family,
+// o-series) that fix temperature at 1 and reject any explicit value. A
+// zero value inherits the supplied default; any other value is sent
+// verbatim.
+func resolveTemperature(configured, def float64) *float32 {
+	if configured < 0 {
+		return nil
+	}
+	t := float32(configured)
+	if configured == 0 {
+		t = float32(def)
+	}
+	return &t
+}

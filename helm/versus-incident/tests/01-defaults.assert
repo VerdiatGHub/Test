@@ -1,0 +1,12 @@
+gateway_secret: \$\{GATEWAY_SECRET\}
+- name: GATEWAY_SECRET
+gateway_secret: ""
+storage:
+- name: STORAGE_TYPE
+mountPath: /app/data
+emptyDir: \{\}
+!agent_ai_api_key
+!AGENT_ENABLE
+!AGENT_AI_ENABLE
+!STORAGE_FILE_DATA_DIR
+!kind: PersistentVolumeClaim
